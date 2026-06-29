@@ -119,6 +119,20 @@ func (scheduler *MessageSchedulerImpl) dispatchMessage(scheduledMsg *data.Schedu
 	}()
 
 	err := inLockRun(scheduler.lockRepo, scheduledMsg, func() error {
+		// Re-check status after acquiring the lock. Another replica may have
+		// dispatched this row between our SELECT and our lock acquisition;
+		// without this check, we would proceed and collide on the duplicate
+		// message-ID constraint, producing the duplicate-key error storm.
+		fresh, err := scheduler.scheduledMsgRepo.GetByID(scheduledMsg.ID.String())
+		if err != nil {
+			log.Error().Err(err).Str("scheduledId", scheduledMsg.ID.String()).Msg("Failed to refresh scheduled message after acquiring lock")
+			scheduler.metricsCollector.IncreaseSchedulingErrorCount()
+			return err
+		}
+		if fresh.Status != data.ScheduledMsgStatusScheduled {
+			return nil
+		}
+
 		// Create regular message from scheduled message
 		message, err := data.NewMessage(
 			scheduledMsg.BroadcastedTo,
@@ -140,18 +154,23 @@ func (scheduler *MessageSchedulerImpl) dispatchMessage(scheduledMsg *data.Schedu
 		// Create the message in the regular message table
 		err = scheduler.msgRepo.Create(message)
 		if err != nil {
-			if err == storage.ErrDuplicateMessageIDForChannel {
-				// Handle potential race condition
-				time.Sleep(100 * time.Millisecond)
-				refreshedMsg, getErr := scheduler.scheduledMsgRepo.GetByID(scheduledMsg.ID.String())
-				if getErr == nil && refreshedMsg.Status == data.ScheduledMsgStatusScheduled {
-					log.Error().Str("messageId", message.MessageID).Msg("Race condition detected: Message already created but status not updated")
-				}
-			} else {
+			if err != storage.ErrDuplicateMessageIDForChannel {
 				log.Error().Err(err).Str("messageId", message.MessageID).Msg("Failed to create message from scheduled message")
 				scheduler.metricsCollector.IncreaseSchedulingErrorCount()
+				return err
 			}
-			return err
+			// The just-completed recheck saw status=Scheduled, so this duplicate
+			// is not from a concurrent replica — it's a prior dispatch attempt
+			// that crashed between Create and MarkDispatched. Reconcile by
+			// adopting the persisted message and completing the remaining steps.
+			existing, getErr := scheduler.msgRepo.Get(scheduledMsg.BroadcastedTo.ChannelID, message.MessageID)
+			if getErr != nil {
+				log.Error().Err(getErr).Str("messageId", message.MessageID).Msg("Race condition detected: Message already created but status not updated")
+				scheduler.metricsCollector.IncreaseSchedulingErrorCount()
+				return getErr
+			}
+			log.Warn().Str("messageId", message.MessageID).Msg("Reconciling partially-dispatched scheduled message from prior crashed attempt")
+			message = existing
 		}
 
 		// Update scheduled message status to dispatched and set dispatchedAt
