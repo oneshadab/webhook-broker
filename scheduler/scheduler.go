@@ -154,23 +154,9 @@ func (scheduler *MessageSchedulerImpl) dispatchMessage(scheduledMsg *data.Schedu
 		// Create the message in the regular message table
 		err = scheduler.msgRepo.Create(message)
 		if err != nil {
-			if err != storage.ErrDuplicateMessageIDForChannel {
-				log.Error().Err(err).Str("messageId", message.MessageID).Msg("Failed to create message from scheduled message")
-				scheduler.metricsCollector.IncreaseSchedulingErrorCount()
-				return err
-			}
-			// The just-completed recheck saw status=Scheduled, so this duplicate
-			// is not from a concurrent replica — it's a prior dispatch attempt
-			// that crashed between Create and MarkDispatched. Reconcile by
-			// adopting the persisted message and completing the remaining steps.
-			existing, getErr := scheduler.msgRepo.Get(scheduledMsg.BroadcastedTo.ChannelID, message.MessageID)
-			if getErr != nil {
-				log.Error().Err(getErr).Str("messageId", message.MessageID).Msg("Race condition detected: Message already created but status not updated")
-				scheduler.metricsCollector.IncreaseSchedulingErrorCount()
-				return getErr
-			}
-			log.Warn().Str("messageId", message.MessageID).Msg("Reconciling partially-dispatched scheduled message from prior crashed attempt")
-			message = existing
+			log.Error().Err(err).Str("messageId", message.MessageID).Msg("Failed to create message from scheduled message")
+			scheduler.metricsCollector.IncreaseSchedulingErrorCount()
+			return err
 		}
 
 		// Update scheduled message status to dispatched and set dispatchedAt
