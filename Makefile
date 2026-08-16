@@ -98,9 +98,11 @@ time-test:
 
 ci-test:
 	go test -timeout 45s -mod=readonly -v ./... -short
+	go test -v -race -timeout 45s -mod=readonly -run '_Race' ./...
 
 test:
 	go test -v -timeout 45s -mod=readonly ./...
+	go test -v -race -timeout 45s -mod=readonly -run '_Race' ./...
 
 install: build
 	go install -mod=readonly

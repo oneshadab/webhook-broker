@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -67,3 +68,23 @@ func TestMemoryCache(t *testing.T) {
 	})
 }
 
+func TestMemoryCache_Race(t *testing.T) {
+	t.Run("ConcurrentGetExpired", func(t *testing.T) {
+		cache := NewMemoryCache[string, int](time.Hour)
+		defer cache.Close()
+
+		// Insert an already-expired item, then read it from many goroutines at once.
+		cache.cache["k"] = &CacheItem[string, int]{Value: 1, Expiration: time.Now().Add(-time.Minute)}
+
+		var wg sync.WaitGroup
+		for range 10 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, ok := cache.Get("k")
+				assert.False(t, ok)
+			}()
+		}
+		wg.Wait()
+	})
+}
