@@ -295,11 +295,55 @@ func (djRepo *DeliveryJobDBRepository) GetJobsInflightSince(delta time.Duration)
 	return djRepo.getJobsForStatusAndDelta(data.JobInflight, delta, true)
 }
 
+// readyForInflightJobsQueryBase backs GetJobsReadyForInflightSince (and its plan regression
+// test). It orders and keyset-paginates on earliestNextAttemptAt -- the column the sweep
+// actually filters on -- so `retry_job` (status, earliestNextAttemptAt, id, createdAt) from
+// migration 000003 serves the predicate, the ORDER BY and the LIMIT in a single range seek.
+// The previous shape ordered by createdAt DESC, which made the optimizer prefer
+// job_status_created_id; that index does not contain earliestNextAttemptAt, so every candidate
+// needed a clustered-index row lookup just to be discarded -> a LIMIT 100 read ~190k rows and
+// took ~19s in production. Sorting oldest-due-first is also the correct order for a retry
+// queue; createdAt DESC starved the jobs that had been waiting longest.
+const (
+	// readyForInflightJobsPageSize must stay in sync with the LIMIT_100_SUFFIX used in the ORDER
+	// BY clause; the loop compares against it to detect a short (final) page.
+	readyForInflightJobsPageSize  = 100
+	readyForInflightJobsQueryBase = jobCommonProjection + " FROM job WHERE status = ? AND earliestNextAttemptAt <= ?" +
+		" AND (retryAttemptCount >= ? OR consumerId NOT IN (SELECT id FROM consumer WHERE type = ?))"
+	readyForInflightJobsOrderBy = " ORDER BY earliestNextAttemptAt ASC, id ASC" + string(LIMIT_100_SUFFIX)
+	// The row-value cursor is what keeps the continuation a range seek on retry_job instead of a
+	// post-scan filter; an `enaa > ? OR (enaa = ? AND id > ?)` rewrite is not range-optimizable.
+	readyForInflightJobsCursor         = " AND (earliestNextAttemptAt, id) > (?, ?)"
+	readyForInflightJobsFirstPageQuery = readyForInflightJobsQueryBase + readyForInflightJobsOrderBy
+	readyForInflightJobsNextPageQuery  = readyForInflightJobsQueryBase + readyForInflightJobsCursor + readyForInflightJobsOrderBy
+)
+
 // GetJobsReadyForInflightSince retrieves jobs in queued status and earliestNextAttemptAt < `now`-delta
 func (djRepo *DeliveryJobDBRepository) GetJobsReadyForInflightSince(delta time.Duration, retryThreshold int) []*data.DeliveryJob {
-	query := fmt.Sprintf(`%s (retryAttemptCount >= %d OR consumerId NOT IN (SELECT id FROM consumer WHERE type = %d)) AND`,
-		jobCommonSelectQuery, retryThreshold, data.PullConsumer)
-	return djRepo.getJobsForStatusAndDeltaWithCustomQuery(data.JobQueued, delta, false, query, "")
+	if delta > 0 {
+		delta = -1 * delta
+	}
+	// The boundary is fixed for the whole sweep; recomputing time.Now() per page would move it
+	// underneath an advancing cursor and let rows slip through between pages.
+	dueBy := time.Now().Add(delta)
+	jobs := make([]*data.DeliveryJob, 0)
+	query := readyForInflightJobsFirstPageQuery
+	args := []interface{}{data.JobQueued, dueBy, retryThreshold, data.PullConsumer}
+	for {
+		pageJobs, _, err := djRepo.getJobs(query, nil, nil, args)
+		if err != nil {
+			log.Error().Err(err).Msg("error - could not list jobs ready for inflight")
+			break
+		}
+		jobs = append(jobs, pageJobs...)
+		if len(pageJobs) < readyForInflightJobsPageSize {
+			break
+		}
+		last := pageJobs[len(pageJobs)-1]
+		query = readyForInflightJobsNextPageQuery
+		args = []interface{}{data.JobQueued, dueBy, retryThreshold, data.PullConsumer, last.EarliestNextAttemptAt, last.ID.String()}
+	}
+	return jobs
 }
 
 // GetByID loads the delivery job with specified id if it exists, else returns an error
@@ -424,3 +468,5 @@ func (djRepo *DeliveryJobDBRepository) GetDeadJobCountsSinceCheckpoint(since tim
 func NewDeliveryJobRepository(db *sql.DB, msgRepo MessageRepository, consumerRepo ConsumerRepository) DeliveryJobRepository {
 	return &DeliveryJobDBRepository{db: db, mesageRepository: msgRepo, consumerRepository: consumerRepo}
 }
+
+// Generated with assistance from Claude AI
