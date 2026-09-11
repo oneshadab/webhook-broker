@@ -372,8 +372,6 @@ func TestStatusBasedJobsListing(t *testing.T) {
 	})
 }
 
-// TestGetJobsReadyForInflightSincePaginates covers the keyset continuation: the sweep must walk
-// past the first LIMIT 100 page and return every due job exactly once.
 func TestGetJobsReadyForInflightSincePaginates(t *testing.T) {
 	djRepo := getDeliverJobRepository()
 	msgRepo := getMessageRepository()
@@ -398,8 +396,7 @@ func TestGetJobsReadyForInflightSincePaginates(t *testing.T) {
 	assert.Nil(t, djRepo.DispatchMessage(message, pageJobs...))
 	defer func() { assert.Nil(t, djRepo.DeleteJobsForMessage(message)) }()
 
-	// Spread earliestNextAttemptAt so the rows straddle several pages of the (earliestNextAttemptAt,
-	// id) cursor rather than all colliding on one timestamp.
+	// Spread earliestNextAttemptAt so the rows straddle pages instead of colliding on one timestamp.
 	pastTime := time.Now().Add(-1 * time.Hour)
 	for index, job := range pageJobs {
 		_, err := testDB.Exec("UPDATE job SET earliestNextAttemptAt = ? WHERE id like ?",
@@ -418,15 +415,11 @@ func TestGetJobsReadyForInflightSincePaginates(t *testing.T) {
 	}
 }
 
-// TestReadyForInflightJobsQueryPlan is a regression guard: the ACTUAL queries used by
-// GetJobsReadyForInflightSince must be served by the retry_job index (migration 000003) with no
-// filesort. Ordering on createdAt instead sends the optimizer to job_status_created_id, which does
-// not carry earliestNextAttemptAt, so every candidate costs a row lookup before being discarded --
-// that is what made this sweep read ~190k rows per LIMIT 100 page in production. These bind to the
-// real query consts, so reverting the ORDER BY or dropping the row-value cursor fails the test.
-// Runs against the SQLite test DB; SQLite reports a filesort as "USE TEMP B-TREE FOR ORDER BY".
-// On SQLite the filesort assertion is the one that catches a regression -- SQLite picks retry_job
-// even for the createdAt ordering and then sorts, whereas MySQL avoids the sort by switching index.
+// Regression guard: the ACTUAL queries used by GetJobsReadyForInflightSince must be served by
+// retry_job with no filesort, else the sweep degrades to ~190k rows per LIMIT 100 page. Binds to
+// the real query consts, so reverting the ORDER BY or the row-value cursor fails the test. Runs
+// on SQLite, which picks retry_job either way but reports the sort as "USE TEMP B-TREE FOR ORDER
+// BY" -- so that assertion, not the index name, is the one that catches a regression here.
 func TestReadyForInflightJobsQueryPlan(t *testing.T) {
 	explain := func(t *testing.T, query string, args ...interface{}) string {
 		rows, err := testDB.Query("EXPLAIN QUERY PLAN "+query, args...)
